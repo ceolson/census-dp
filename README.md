@@ -1,0 +1,1 @@
+The folder eiPack contains small modifications of the software published at `https://cran.r-project.org/web/packages/eiPack/index.html` written by Olivia Lau, Ryan T. Moore, and Michael Kellermann. The modifications allow for the addition of privacy noise to the model.
