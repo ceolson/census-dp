@@ -52,8 +52,9 @@ rbycei_fcn1 (
 
   double prop_pop, total, curr_pop, curr_pop_ll, prop_pop_ll, noise_scale, pois_parameter;
   double prop_weighted_beta, curr_weighted_beta;
-  double noise_xx, curr_xx, prop_xx;
-  double noise_last_t, prop_last_t_ll, curr_last_t_ll, prop_last_t, curr_last_t, aggregate_beta, prop_total;
+  double noise_xx, curr_xx, prop_xx, prop_last_xx, curr_last_xx, prop_last_pop, curr_last_pop;
+  double noise_last_t, prop_last_t, curr_last_t, aggregate_beta, prop_total;
+  long double prop_last_t_ll, curr_last_t_ll;
 
 
   ng = INTEGER(NG)[0];
@@ -70,6 +71,9 @@ rbycei_fcn1 (
   noise_scale = REAL(Noise_scale)[0];
   pois_parameter = REAL(Pois_parameter)[0];
 
+  // printf("Entering c code, t noisy: %f %f %f\n", REAL(TT_noisy)[0 + np*1], 
+  //   REAL(TT_noisy)[1 + np*1],
+  //   REAL(TT_noisy)[2 + np*1]);
 
   /*
    */
@@ -131,38 +135,39 @@ for(kk = 0; kk < iters; ++kk){
         total += REAL(TT)[cc + np*ii];
       }
 
-      for (rr = 0; rr < ng; ++rr){
+      for (rr = 0; rr < (ng - 1); ++rr){
 
-        noise_xx = rnorm(0, 0.05);
-        total_ctr++;
-        if (REAL(XX)[rr + ng*ii] + noise_xx >= 0 && REAL(XX)[rr + ng*ii] + noise_xx < 1) {
-          
-          curr_xx = REAL(XX)[rr + ng*ii];
-          prop_xx = (REAL(XX)[rr + ng*ii] + noise_xx) / (1 + noise_xx);
+        prop_xx = rnorm(REAL(XX)[rr + ng*ii], 0.05);
+        curr_xx = REAL(XX)[rr + ng*ii];
+        curr_last_xx = REAL(XX)[(ng - 1) + ng*ii];
+        prop_last_xx = curr_last_xx - (prop_xx - curr_xx);
 
+        if (prop_xx > 0 && prop_xx < curr_xx + curr_last_xx) {
           curr_pop = curr_xx * total;
+          curr_last_pop = curr_last_xx * total;
           prop_pop = prop_xx * total;
-
-          if (kk % 1000 == 0 && ii == 10) {
-            printf("%i: Current: %f, Prop: %f\n", kk, curr_pop, prop_pop);
-          }
+          prop_last_pop = prop_last_xx * total;
 
           prop_pop_ll = // -log(lgammafn(prop_pop + 1)) + prop_pop*log(pois_parameter / ng) 
-                        - (1 / (2*noise_scale*noise_scale))*pow((prop_xx * total - REAL(XX_noisy)[rr + ng*ii] * total), 2);
+                        - (1 / (2*noise_scale*noise_scale))*pow((prop_pop - REAL(XX_noisy)[rr + ng*ii] * total), 2)
+                        - (1 / (2*noise_scale*noise_scale))*pow((prop_last_pop - REAL(XX_noisy)[(ng - 1) + ng*ii] * total), 2);
           curr_pop_ll = // -log(lgammafn(curr_pop + 1)) + curr_pop*log(pois_parameter / ng) 
-                        - (1 / (2*noise_scale*noise_scale))*pow((curr_pop * total - REAL(XX_noisy)[rr + ng*ii] * total), 2);
+                        - (1 / (2*noise_scale*noise_scale))*pow((curr_pop - REAL(XX_noisy)[rr + ng*ii] * total), 2)
+                        - (1 / (2*noise_scale*noise_scale))*pow((curr_last_pop - REAL(XX_noisy)[(ng - 1) + ng*ii] * total), 2);
 
           for (cc = 0; cc < np; ++cc) {
-            prop_weighted_beta = REAL(betaarray)[rr + ng*cc + ng*np*ii] * prop_xx;
-            curr_weighted_beta = REAL(betaarray)[rr + ng*cc + ng*np*ii] * curr_xx;
+            prop_weighted_beta = REAL(betaarray)[rr + ng*cc + ng*np*ii] * prop_xx
+                                 + REAL(betaarray)[(ng - 1) + ng*cc + ng*np*ii] * prop_last_xx;
+            curr_weighted_beta = REAL(betaarray)[rr + ng*cc + ng*np*ii] * curr_xx
+                                 + REAL(betaarray)[(ng - 1) + ng*cc + ng*np*ii] * curr_last_xx;
               
-            prop_pop_ll += REAL(TT)[cc + ng*cc] * log(prop_weighted_beta);
-            curr_pop_ll += REAL(TT)[cc + ng*cc] * log(curr_weighted_beta);
+            prop_pop_ll += REAL(TT)[cc + np*ii] * log(prop_weighted_beta);
+            curr_pop_ll += REAL(TT)[cc + np*ii] * log(curr_weighted_beta);
           }
 
           if (acc_tog(prop_pop_ll, curr_pop_ll) == 1){
-            change_ctr++;
-            REAL(XX)[rr + ng*ii] = prop_pop;
+            REAL(XX)[rr + ng*ii] = prop_xx;
+            REAL(XX)[(ng - 1) + ng*ii] = prop_last_xx;
           }
         }
       }
@@ -172,18 +177,18 @@ for(kk = 0; kk < iters; ++kk){
       prop_total = total + noise_last_t;
       curr_last_t = REAL(TT)[(np - 1) + np*ii];
 
-      if (prop_last_t >= 0 && prop_last_t <= total) {
+      if (prop_last_t > 0) {
 
-        prop_last_t_ll = -(1 / (2*noise_scale*noise_scale))*pow((prop_last_t - REAL(TT_noisy)[rr + ng*ii]), 2);
-        curr_last_t_ll = -(1 / (2*noise_scale*noise_scale))*pow((curr_last_t - REAL(TT_noisy)[rr + ng*ii]), 2);
+        prop_last_t_ll = -(1 / (2*noise_scale*noise_scale))*pow((prop_last_t - REAL(TT_noisy)[(np - 1) + np*ii]), 2);
+        curr_last_t_ll = -(1 / (2*noise_scale*noise_scale))*pow((curr_last_t - REAL(TT_noisy)[(np - 1) + np*ii]), 2);
 
         aggregate_beta = 0;
         for (rr = 0; rr < ng; ++rr) {
-          aggregate_beta += REAL(XX)[rr + ng*ii] * REAL(betaarray)[rr + ng*cc + ng*np*ii];
+          aggregate_beta += REAL(XX)[rr + ng*ii] * REAL(betaarray)[rr + (np - 1)*ng + ng*np*ii];
         }
 
-        prop_last_t_ll += log(lgammafn(prop_total + 1)) - log(lgammafn(prop_last_t + 1)) + prop_last_t * log(aggregate_beta) + (total - prop_last_t) * log(1 - aggregate_beta);
-        curr_last_t_ll += log(lgammafn(total + 1)) - log(lgammafn(curr_last_t + 1)) + curr_last_t * log(aggregate_beta) + (total - curr_last_t) * log(1 - aggregate_beta);
+        prop_last_t_ll += lgammafn(prop_total + 1) - lgammafn(prop_last_t + 1) + prop_last_t * log(aggregate_beta);
+        curr_last_t_ll += lgammafn(total + 1) - lgammafn(curr_last_t + 1) + curr_last_t * log(aggregate_beta);
 
         if (acc_tog(prop_last_t_ll, curr_last_t_ll) == 1) {
           REAL(TT)[(np - 1) + np*ii] = prop_last_t;
@@ -336,7 +341,12 @@ for(qq = 0; qq < ng*np; ++qq){
   PutRNGstate();
   UNPROTECT(nProtected); 
 
-  // printf("%i, %i\n", change_ctr, total_ctr);
+  // for (rr = 0; rr < ng; ++rr) {
+  //   printf("Predicted x%i in precinct 1: %f\n", rr, REAL(XX)[rr + 1*ng]);
+  // }
+  // printf("Predicted last t in precinct 1: %f\n", rr, REAL(TT)[(np - 1) + 1*np]);
+
+  // printf("Last t noisy: %f\n", REAL(TT_noisy)[(np - 1) + np*1]);
 
   return(output_list); 
 

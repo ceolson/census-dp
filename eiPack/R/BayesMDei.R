@@ -35,12 +35,12 @@ BayesMDei <- function(formula, data, total, lambda1 = 4, lambda2 = 2,
 #     stop("one or both marginals are proportions - 'total' must be
 # provided")}
 
-#   if(propParty & !is.null(total)){
-#     DD[[1]] <- DD[[1]] * total
-#   warning("column marginals are proportions - multiplying by unit size")}
-#   if(propGroup & !is.null(total)){
-#     DD[[2]] <- DD[[2]] * total
-#    warning("row margnials are proportions - multiplying by unit size")}
+  # if(propParty & !is.null(total)){
+  #   DD[[1]] <- DD[[1]] * total
+  # warning("column marginals are proportions - multiplying by unit size")}
+  # if(propGroup & !is.null(total)){
+  #   DD[[2]] <- DD[[2]] * total
+  #  warning("row margnials are proportions - multiplying by unit size")}
 
 #   checkGroups <- round(apply(DD[[2]], 1, sum), 1)
 #   checkParties <- round(apply(DD[[1]], 1, sum), 1)
