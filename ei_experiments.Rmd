@@ -1,0 +1,401 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(rBeta2009)
+library(dplyr)
+library(sf)
+library(rjags)
+library(tidyr)
+library(ggplot2)
+library(eiPack)
+```
+
+```{r}
+make_synth_data <- function(K_demo, epsilon, population_mean, add_unmeasured_noise = 0) {
+  alpha_demo <- pmax(rnorm(6, 5, 3), 0.0001)
+  alpha_demo <- array(alpha_demo, dim=c(2, 3))
+  
+  n <- as.integer(rpois(K_demo, population_mean))
+  
+  param_r <- rgamma(2, 2, 2)
+  
+  data_demo <- data.frame(n)
+  
+  data_demo <- data_demo %>%
+    mutate(x1 = as.integer(rbeta(K_demo, param_r[[1]], param_r[[2]]) * n)) %>%
+    mutate(x2 = n - x1)
+  
+  dirich1 <- rdirichlet(K_demo, alpha_demo[1,])
+  dirich2 <- rdirichlet(K_demo, alpha_demo[2,])
+  
+  data_demo$beta11 <- dirich1[, 1]
+  data_demo$beta12 <- dirich1[, 2]
+  data_demo$beta13 <- dirich1[, 3]
+  data_demo$beta21 <- dirich2[, 1]
+  data_demo$beta22 <- dirich2[, 2]
+  data_demo$beta23 <- dirich2[, 3]
+  
+  
+  sample_votes <- function(row) {
+    return(t(rmultinom(1, row["n"], c(row["beta_aggregate1"], row["beta_aggregate2"], row["beta_aggregate3"]))))
+  }
+  
+  data_demo <- data_demo %>%
+    mutate(beta_aggregate1 = (x1 / n) * beta11 + (x2 / n) * beta21) %>%
+    mutate(beta_aggregate2 = (x1 / n) * beta12 + (x2 / n) * beta22) %>%
+    mutate(beta_aggregate3 = (x1 / n) * beta13 + (x2 / n) * beta23)
+  
+  votes <- t(apply(data_demo, 1, sample_votes))
+  data_demo$t1 <- round(votes[, 1])
+  data_demo$t2 <- round(votes[, 2])
+  data_demo$t3 <- round(votes[, 3])
+  
+  if (add_unmeasured_noise > 0) {
+    data_demo$x1 = pmax(0, data_demo$x1 + rnorm(nrow(data_demo), 0, add_unmeasured_noise))
+    data_demo$x2 = pmax(0, data_demo$x2 + rnorm(nrow(data_demo), 0, add_unmeasured_noise))
+    data_demo$n = data_demo$x1 + data_demo$x2
+  }
+  
+  
+  data_demo <- privatize_data(data_demo, epsilon)
+  
+  true_vals = c(alpha_demo[[1, 1]],
+              alpha_demo[[2, 1]],
+              alpha_demo[[1, 2]],
+              alpha_demo[[2, 2]],
+              alpha_demo[[1, 3]],
+              alpha_demo[[2, 3]],
+              alpha_demo[[1, 1]] / (alpha_demo[[1, 1]] + alpha_demo[[1, 2]] + alpha_demo[[1, 3]]),
+              alpha_demo[[2, 1]] / (alpha_demo[[2, 1]] + alpha_demo[[2, 2]] + alpha_demo[[2, 3]]),
+              alpha_demo[[1, 2]] / (alpha_demo[[1, 1]] + alpha_demo[[1, 2]] + alpha_demo[[1, 3]]),
+              alpha_demo[[2, 2]] / (alpha_demo[[2, 1]] + alpha_demo[[2, 2]] + alpha_demo[[2, 3]]),
+              alpha_demo[[1, 3]] / (alpha_demo[[1, 1]] + alpha_demo[[1, 2]] + alpha_demo[[1, 3]]),
+              alpha_demo[[2, 3]] / (alpha_demo[[2, 1]] + alpha_demo[[2, 2]] + alpha_demo[[2, 3]])
+  )
+  
+  ret <- list("data" = data_demo, "true_vals" = true_vals)
+  
+  return (ret)
+}
+
+gauss_mech_sd <- function(sensitivity, ep, de) {
+  return(sqrt(2 * log(1.25 / de) * sensitivity^2 / ep^2))
+}
+
+privatize_data <- function(data, epsilon, delta = 10 ** (-10)) {
+  K_demo <- nrow(data)
+  noise_scale <- gauss_mech_sd(1, epsilon, delta)
+  
+  ret <- data %>%
+    mutate(z1 = x1 + rnorm(K_demo, 0, noise_scale)) %>%
+    mutate(z2 = x2 + rnorm(K_demo, 0, noise_scale)) %>%
+    mutate(m = n + rnorm(K_demo, 0, noise_scale)) %>%
+    mutate(t3_noisy = m - (t1 + t2))
+  
+  return (ret)
+}
+
+make_beta_columns_synth <- function(df, private = FALSE) {
+  if (private) {
+    df["beta.z1.t1"] <- df$alpha.z1.t1 / (df$alpha.z1.t1 + df$alpha.z1.t2 + df$alpha.z1.t3_noisy)
+    df["beta.z1.t2"] <- df$alpha.z1.t2 / (df$alpha.z1.t1 + df$alpha.z1.t2 + df$alpha.z1.t3_noisy)
+    df["beta.z1.t3_noisy"] <- df$alpha.z1.t3_noisy / (df$alpha.z1.t1 + df$alpha.z1.t2 + df$alpha.z1.t3_noisy)
+    df["beta.z2.t1"] <- df$alpha.z2.t1 / (df$alpha.z2.t1 + df$alpha.z2.t2 + df$alpha.z2.t3_noisy)
+    df["beta.z2.t2"] <- df$alpha.z2.t2 / (df$alpha.z2.t1 + df$alpha.z2.t2 + df$alpha.z2.t3_noisy)
+    df["beta.z2.t3_noisy"] <- df$alpha.z2.t3_noisy / (df$alpha.z2.t1 + df$alpha.z2.t2 + df$alpha.z2.t3_noisy)
+  } else {
+    df["beta.x1.t1"] <- df$alpha.x1.t1 / (df$alpha.x1.t1 + df$alpha.x1.t2 + df$alpha.x1.t3)
+    df["beta.x1.t2"] <- df$alpha.x1.t2 / (df$alpha.x1.t1 + df$alpha.x1.t2 + df$alpha.x1.t3)
+    df["beta.x1.t3"] <- df$alpha.x1.t3 / (df$alpha.x1.t1 + df$alpha.x1.t2 + df$alpha.x1.t3)
+    df["beta.x2.t1"] <- df$alpha.x2.t1 / (df$alpha.x2.t1 + df$alpha.x2.t2 + df$alpha.x2.t3)
+    df["beta.x2.t2"] <- df$alpha.x2.t2 / (df$alpha.x2.t1 + df$alpha.x2.t2 + df$alpha.x2.t3)
+    df["beta.x2.t3"] <- df$alpha.x2.t3 / (df$alpha.x2.t1 + df$alpha.x2.t2 + df$alpha.x2.t3)
+  }
+  return(df)
+}
+```
+
+```{r}
+experiment <- function(num_precincts, 
+                       epsilon, 
+                       population_mean, 
+                       trials = 100, 
+                       verbose = FALSE, 
+                       iters = 50000,
+                       add_unmeasured_noise = FALSE) {
+  noise_scale = gauss_mech_sd(1, epsilon, 10 ** (-10))
+
+  formula <- cbind(t1, t2, t3) ~ cbind(x1, x2)
+  formula_private <- cbind(t1, t2, t3_noisy) ~ cbind(z1, z2)
+  
+  names_standard = as.list(unite(expand.grid(c("x1", "x2"), c("t1", "t2", "t3")), new, sep = "."))[[1]]
+  alpha_vars_standard = sapply(names_standard, function(x) { return(paste("alpha.", x, sep = ""))})
+  beta_vars_standard = sapply(names_standard, function(x) { return(paste("beta.", x, sep = ""))})
+  vars_standard = as.vector(c(alpha_vars_standard, beta_vars_standard))
+  
+  names_private = as.list(unite(expand.grid(c("z1", "z2"), c("t1", "t2", "t3_noisy")), new, sep = "."))[[1]]
+  alpha_vars_private = sapply(names_private, function(x) { return(paste("alpha.", x, sep = ""))})
+  beta_vars_private = sapply(names_private, function(x) { return(paste("beta.", x, sep = ""))})
+  vars_private = as.vector(c(alpha_vars_private, beta_vars_private))
+  
+  standard_results <- data.frame(data.frame(matrix(ncol = length(beta_vars_standard), nrow = 0)))
+  colnames(standard_results) <- beta_vars_standard
+  
+  naive_results = data.frame(data.frame(matrix(ncol = length(beta_vars_standard), nrow = 0)))
+  colnames(naive_results) <- beta_vars_standard
+  
+  private_results = data.frame(data.frame(matrix(ncol = length(beta_vars_standard), nrow = 0)))
+  colnames(private_results) <- beta_vars_standard
+  
+  true_results = data.frame(data.frame(matrix(ncol = length(beta_vars_standard), nrow = 0)))
+  colnames(true_results) <- beta_vars_standard
+  
+  for (i in 1:trials) {
+    if (verbose) {
+      print(i)
+    }
+    ret <- make_synth_data(num_precincts, epsilon, population_mean, add_unmeasured_noise = add_unmeasured_noise)
+    
+    
+    data_demo <- ret$data
+    true_vals <- ret$true_vals
+    
+    out_standard <- ei.MD.bayes(formula, 
+                     total = "n", 
+                     data = data_demo,
+                     sample = iters,
+                     burnin = 2000,
+                     privacy = FALSE
+                     )
+    out_naive <- ei.MD.bayes(formula_private, 
+                     total = "m", 
+                     data = data_demo,
+                     sample = iters,
+                     burnin = 2000,
+                     privacy = FALSE
+                     )
+    out_private <- ei.MD.bayes(formula_private, 
+                     total = "m", 
+                     data = data_demo,
+                     sample = iters,
+                     burnin = 2000,
+                     privacy = TRUE,
+                     noise_scale = noise_scale,
+                     pois_parameter = 1000
+                     )
+    
+    draws_standard <- data.frame(out_standard$draws$Alpha)
+    draws_standard <- make_beta_columns_synth(draws_standard)
+    
+    draws_naive <- data.frame(out_naive$draws$Alpha)
+    draws_naive <- make_beta_columns_synth(draws_naive, private = TRUE)
+    
+    draws_private <- data.frame(out_private$draws$Alpha)
+    draws_private <- make_beta_columns_synth(draws_private, private = TRUE)
+    
+    standard_means <- sapply(beta_vars_standard, function(var) {return(mean(draws_standard[var][[1]]))})
+    naive_means <- sapply(beta_vars_private, function(var) {return(mean(draws_naive[var][[1]]))})
+    private_means <- sapply(beta_vars_private, function(var) {return(mean(draws_private[var][[1]]))})
+    
+    standard_results[nrow(standard_results) + 1,] <- t(standard_means)
+    naive_results[nrow(naive_results) + 1,] <- t(naive_means)
+    private_results[nrow(private_results) + 1,] <- t(private_means)
+    true_results[nrow(true_results) + 1,] <- t(true_vals[7:12])
+  }
+  
+  ret <- list("standard" = standard_results, "naive" = naive_results, "private" = private_results, "true" = true_results)
+  return(ret)
+}
+```
+
+```{r}
+formula <- cbind(t1, t2, t3) ~ cbind(x1, x2)
+formula_private <- cbind(t1, t2, t3_noisy) ~ cbind(z1, z2)
+
+names_standard = as.list(unite(expand.grid(c("x1", "x2"), c("t1", "t2", "t3")), new, sep = "."))[[1]]
+alpha_vars_standard = sapply(names_standard, function(x) { return(paste("alpha.", x, sep = ""))})
+beta_vars_standard = sapply(names_standard, function(x) { return(paste("beta.", x, sep = ""))})
+vars_standard = as.vector(c(alpha_vars_standard, beta_vars_standard))
+
+names_private = as.list(unite(expand.grid(c("z1", "z2"), c("t1", "t2", "t3_noisy")), new, sep = "."))[[1]]
+alpha_vars_private = sapply(names_private, function(x) { return(paste("alpha.", x, sep = ""))})
+beta_vars_private = sapply(names_private, function(x) { return(paste("beta.", x, sep = ""))})
+vars_private = as.vector(c(alpha_vars_private, beta_vars_private))
+```
+
+```{r}
+epsilons_list = c(0.005, 0.05, 0.5, 1, 5)
+standard_out_epsilons = list()
+naive_out_epsilons = list()
+private_out_epsilons = list()
+
+for (epsilon in epsilons_list) {
+  ret <- experiment(num_precincts = 50, 
+                    epsilon = epsilon, 
+                    population_mean = 1000, 
+                    trials = 10, 
+                    verbose = TRUE, 
+                    iters = 100000, 
+                    add_unmeasured_noise = 0)
+  
+  standard_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$standard[var] - ret$true[var])^2)[[1]]))})
+  naive_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$naive[var] - ret$true[var])^2)[[1]]))})
+  private_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$private[var] - ret$true[var])^2)[[1]]))})
+  
+  standard_out_epsilons <- append(standard_out_epsilons, mean(standard_mses))
+  naive_out_epsilons <- append(naive_out_epsilons, mean(naive_mses))
+  private_out_epsilons <- append(private_out_epsilons, mean(private_mses))
+  
+}
+```
+
+```{r}
+data_for_plot <- data.frame(x = epsilons_list)
+data_for_plot$standard <- unlist(standard_out_epsilons)
+data_for_plot$naive <- unlist(naive_out_epsilons)
+data_for_plot$private <- unlist(private_out_epsilons)
+
+ggplot(data_for_plot, aes(x = x)) +
+  xlab("Epsilon (log scale)") +
+  ylab("Mean MSE across all beta_{r,c}") + 
+  geom_line(aes(y = standard), color = "red") + geom_point(aes(y = standard), color = "red") +
+  geom_line(aes(y = naive), color = "blue") + geom_point(aes(y = naive), color = "blue") +
+  geom_line(aes(y = private), color = "green") + geom_point(aes(y = private), color = "green") +
+  scale_x_continuous(breaks = epsilons_list, trans = "log2")
+```
+
+```{r}
+population_mean_list = c(10, 50, 75, 100, 300, 500, 1000)
+standard_out_pops = list()
+naive_out_pops = list()
+private_out_pops = list()
+
+for (pop_mean in population_mean_list) {
+  ret <- experiment(num_precincts = 50, 
+                    epsilon = 1, 
+                    population_mean = pop_mean, 
+                    trials = 20, 
+                    verbose = TRUE, 
+                    iters = 10000, 
+                    add_unmeasured_noise = 0)
+  
+  standard_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$standard[var] - ret$true[var])^2)[[1]]))})
+  naive_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$naive[var] - ret$true[var])^2)[[1]]))})
+  private_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$private[var] - ret$true[var])^2)[[1]]))})
+  
+  standard_out_pops <- append(standard_out_pops, mean(standard_mses))
+  naive_out_pops <- append(naive_out_pops, mean(naive_mses))
+  private_out_pops <- append(private_out_pops, mean(private_mses))
+}
+```
+
+```{r}
+data_for_plot <- data.frame(x = population_mean_list)
+data_for_plot$standard <- unlist(standard_out_pops)
+data_for_plot$naive <- unlist(naive_out_pops)
+data_for_plot$private <- unlist(private_out_pops)
+
+ggplot(data_for_plot, aes(x = x)) +
+  xlab("Mean population in each precinct") +
+  ylab("Mean MSE across all beta_{r,c}") + 
+  geom_line(aes(y = standard), color = "red") + geom_point(aes(y = standard), color = "red") +
+  geom_line(aes(y = naive), color = "blue") + geom_point(aes(y = naive), color = "blue") +
+  geom_line(aes(y = private), color = "green") + geom_point(aes(y = private), color = "green")
+```
+
+```{r}
+epsilons_list = c(0.005, 0.05, 0.5, 1, 5)
+
+standard_out_add_noise = list()
+naive_out_add_noise = list()
+private_out_add_noise = list()
+
+for (epsilon in epsilons_list) {
+  ret_add_noise <- experiment(num_precincts = 50, 
+                    epsilon = epsilon, 
+                    population_mean = 1000, 
+                    trials = 10, 
+                    verbose = TRUE, 
+                    iters = 10000, 
+                    add_unmeasured_noise = 20)
+
+  standard_mses_add_noise <- sapply(beta_vars_standard, function(var) {return(mean(((ret_add_noise$standard[var] - ret_add_noise$true[var])^2)[[1]]))})
+  naive_mses_add_noise <- sapply(beta_vars_standard, function(var) {return(mean(((ret_add_noise$naive[var] - ret_add_noise$true[var])^2)[[1]]))})
+  private_mses_add_noise <- sapply(beta_vars_standard, function(var) {return(mean(((ret_add_noise$private[var] - ret_add_noise$true[var])^2)[[1]]))})
+
+  standard_out_add_noise <- append(standard_out_add_noise, mean(standard_mses_add_noise))
+  naive_out_add_noise <- append(naive_out_add_noise, mean(naive_mses_add_noise))
+  private_out_add_noise <- append(private_out_add_noise, mean(private_mses_add_noise))
+}
+```
+
+```{r}
+data_for_plot <- data.frame(x = epsilons_list)
+
+data_for_plot$standard_add_noise <- unlist(standard_out_add_noise)
+data_for_plot$naive_add_noise <- unlist(naive_out_add_noise)
+data_for_plot$private_add_noise <- unlist(private_out_add_noise)
+
+ggplot(data_for_plot, aes(x = x)) +
+  xlab("Epsilon (log scale)") +
+  ylab("Mean MSE across all beta_{r,c}") + 
+  geom_line(aes(y = standard_add_noise), color = "red") + geom_point(aes(y = standard_add_noise), color = "red") +
+  geom_line(aes(y = naive_add_noise), color = "blue") + geom_point(aes(y = naive_add_noise), color = "blue") +
+  geom_line(aes(y = private_add_noise), color = "green") + geom_point(aes(y = private_add_noise), color = "green") + 
+  scale_x_continuous(breaks = epsilons_list, trans = "log2")
+```
+
+```{r}
+num_precincts_list = c(10, 50, 100, 150, 200, 500, 1000)
+standard_out = list()
+naive_out = list()
+private_out = list()
+
+for (num_precincts in num_precincts_list) {
+  ret <- experiment(num_precincts = num_precincts, 
+                    epsilon = 1, 
+                    population_mean = 1000, 
+                    trials = 10, 
+                    verbose = TRUE, 
+                    iters = 10000, 
+                    add_unmeasured_noise = 0)
+  
+  standard_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$standard[var] - ret$true[var])^2)[[1]]))})
+  naive_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$naive[var] - ret$true[var])^2)[[1]]))})
+  private_mses <- sapply(beta_vars_standard, function(var) {return(mean(((ret$private[var] - ret$true[var])^2)[[1]]))})
+  
+  standard_out <- append(standard_out, mean(standard_mses))
+  naive_out <- append(naive_out, mean(naive_mses))
+  private_out <- append(private_out, mean(private_mses))
+  
+}
+```
+
+```{r}
+data_for_plot <- data.frame(x = num_precincts_list)
+data_for_plot$standard <- tail(unlist(standard_out), 7)
+data_for_plot$naive <- tail(unlist(naive_out), 7)
+data_for_plot$private <- tail(unlist(private_out), 7)
+
+ggplot(data_for_plot, aes(x = x)) +
+  xlab("Number of Precincts") +
+  ylab("Mean MSE across all beta_{r,c}") + 
+  geom_line(aes(y = standard), color = "red") + geom_point(aes(y = standard), color = "red") +
+  geom_line(aes(y = naive), color = "blue") + geom_point(aes(y = naive), color = "blue") +
+  geom_line(aes(y = private), color = "green") + geom_point(aes(y = private), color = "green")
+  
+```
+
+
+
+
+
+
+
